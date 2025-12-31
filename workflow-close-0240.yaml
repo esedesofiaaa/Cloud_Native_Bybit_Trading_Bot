@@ -1,0 +1,40 @@
+main:
+  params: [input]
+  steps:
+    - init:
+        assign:
+          - project_id: "bybitcronjobs"
+          
+          # AHORA LA REGIÓN Y EL NOMBRE DEL JOB VIENEN EN LA LISTA
+          # Esto te permite mezclar regiones si quisieras, o simplemente copiar
+          # este bloque para usarlo en Asia sin cambiar el código de abajo.
+          - tests_to_close:
+              - { id: "test2_5tkn", secret: "test2_5tkn_creds", region: "asia-northeast1", job: "script3-close-asia-northeast1" }
+              - { id: "test2_10tkn", secret: "test2_10tkn_creds", region: "asia-northeast1", job: "script3-close-asia-northeast1" }
+              - { id: "test2_30tkn", secret: "test2_30tkn_creds", region: "asia-northeast1", job: "script3-close-asia-northeast1" }
+              # Si tuvieras que cerrar algo en Asia a la misma hora:
+              # - { id: "test1_asia", secret: "secret_asia", region: "asia-northeast1", job: "script3-close-asia-northeast1" }
+
+    - ejecutar_cierres_paralelos:
+        parallel:
+          for:
+            value: test_config
+            in: ${tests_to_close}
+            steps:
+              - cerrar_posicion:
+                  call: googleapis.run.v1.namespaces.jobs.run
+                  args:
+                    # Aquí construimos la ruta dinámicamente usando los datos de la lista
+                    name: ${"namespaces/" + project_id + "/jobs/" + test_config.job}
+                    location: ${test_config.region}
+                    body:
+                      overrides:
+                        containerOverrides:
+                          - env:
+                              - name: "TEST_ID"
+                                value: ${test_config.id}
+                              - name: "SECRET_NAME"
+                                value: ${test_config.secret}
+    
+    - final:
+        return: "Cierres ejecutados correctamente."

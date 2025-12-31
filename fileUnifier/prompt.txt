@@ -1,0 +1,2003 @@
+Estoy haciendo un bot de trading, que consta de tres scripts y lo tengo desplegado en gcp
+
+scriot 1
+A1_Get_bybitList_ai_fix
+script 2
+A1_Bybit_tradeExecution_and_List_GSCLOUD_ai_fix
+scriptg 3
+A1_Get_bybitList_ai_fix
+
+el script 1, hace una lista de tokens en csv en bybit diaria a las 2301 utc gracias a un scheduler, y se almacena en un bucket, script2 lee este archivo csv selecciona x cantidad de tokens y crea trades, el script 3 despues de x horas de creados los trades, los cierra, manejando las credenciales en secrets manager de google
+
+de igual manera analiza todo el codigo para corroborar y entender mejor la logica y que si se este teniendo en cuenta el uso de crdenciales de manera segura con secrets
+
+
+en gcp hice lo siguiente, desplegue en cloud run como function dos instancias, la bybit-live-10t contiene el script 1 y 2 y la segunda instancia bybit-10t-close-trades contiene el script 3
+
+la meta de este bot, es hacer 30 combinaciones entre cantidad de tokens y horas de los trades, es decir, modificar el script 2 y 3, este cambio ejm 5 token por 2 horas, seria una combinacion, cada combiancion cuenta con una cuenta demo de bybit en dodne se aplicaran estos trades. Todas las combinaicones utilizan el mismo csv generado por el script 1
+
+actualmente en gcp esta la estrategia de crear un project por cada combinacion, este teniendo su propio bucket y 2 instancias en cloud run, asi lo creo mi jefe, sin embargo a mi parecer es mas trabajo hacerlo asi e implica muchas configuraciones manuales y quizas hasta mas costo y uso de recursos
+
+por lo que quiero entender las ventajas y contras de diferentes configuraciones, incluyeno la actual
+
+mi propuesta/idea es tener un solo proyecto con el script 1 separado en su propia instancia, para que todos los combos puedan usarlo no que este repetido dentro de cada combo y creando un csv por cada combo, sino que solo haga un csv al que todos los combos busquen, y crear una isntancia para cada combinacion de parametros del script 2 y 3 y asi mismo tener un solo buckets pro que cada combo tenga su propia carpeta
+
+mi jefe me dice que escogio la primera estrategia, la de un proyecto or cada combinacion, con 2 instances y su propio buckets, pensando en las ip y qeu bybit no bloqueara o impidiera la ejecucion, y asi mismo que creara las instances en diferente region, no se como funciona o si eso sea un problema en la configuracion que estoy proponiendo yo arriba
+
+use ese promptpreviamente en una conversacion contigo y me diste esta propuesta
+
+4. Arquitectura Recomendada (Híbrida)
+Te sugiero una versión refinada de tu propuesta que satisface la preocupación de tu jefe sin la locura de los 30 proyectos.
+Estructura: 1 Solo Proyecto de GCP.
+Script 1 (Generador):
+Se ejecuta 1 vez al día.
+Guarda master_list.csv en gs://bucket-comun/data/.
+Script 2 y 3 (Ejecutores):
+Se despliegan como un solo Servicio de Cloud Run (o Job) genérico.
+No hardcodees nada. El código debe esperar variables de entorno: TARGET_TOKEN_COUNT, HOLD_TIME_HOURS, API_KEY_SECRET_NAME.
+Orquestación (La Clave):
+Usas Cloud Scheduler para disparar las 30 combinaciones.
+Cada Job de Scheduler pasa variables de entorno distintas al contenedor.
+Ejemplo Scheduler Job 1: TOKENS=5, HORAS=2, SECRET=BOT_01.
+Ejemplo Scheduler Job 2: TOKENS=10, HORAS=4, SECRET=BOT_02.
+Solución al problema de IP (Mitigación):
+En lugar de usar regiones diferentes por proyecto, simplemente añade un "Jitter" (Retraso aleatorio) al inicio de tus scripts.
+Haz que el Bot 1 inicie a las 00:00:00, el Bot 2 a las 00:00:15, el Bot 3 a las 00:00:30.
+Al distribuir las peticiones en el tiempo, Bybit no verá una ráfaga masiva desde la IP de Google y no te bloqueará.
+Resumen de Ventajas y Contras
+CaracterísticaEstrategia Jefe (30 Proyectos)Tu Propuesta (1 Proyecto)Mantenimiento CódigoMuy difícil (30 deploys por cambio)Fácil (1 deploy actualiza todo)Gestión SecretosDispersa en 30 bóvedasCentralizada y organizadaCosto OperativoAlto (tiempo humano + recursos zombis)Bajo (recursos compartidos)Aislamiento IPFalso (Cloud Run comparte IPs igual)Igual (se mitiga con delay/jitter)EscalabilidadLineal (más trabajo por cada bot)Exponencial (añadir un bot es solo configurar un scheduler)
+
+
+la ejecute y tuvo grna parte de errores ya que modificio el codigo de pies a cabeza y se perdio la logica "maestra" de los scripts generenado una cascada de errores que mi jefe ya habia arreglado con sus scripts masters
+
+sim embargo me gusto la estrategia de tener el scrit 1 estatico y asilado y que el 2 y 3 fueran genericos con variabes modificbles y hai usar los test, lo hice con jobs como se planteo la idea, sin embargo no puedo usar el jitter, necesito que si o si se ejecuten al tiempo los open para la n cantidad de test y los close puede que algunos test cierren al tiempo, asi que tambien sucederia que se ejecuta el mismo script pero en paralelo y no se si se pueda ese procesamient paralelo o como se configure
+
+y ahi regresa el problema de las mismas ip por region, se me ocurre tratar la region como una variable y que cada test tenga configurada uan propia region, asi mismo para el almacenamiento, el script 1 alamcena en el bucket el csv que luego el script 2 leerla, sin embargo el script 2 genera 2 csv files, account_pnl.csv y account_trades.csv, por lo que es necesario crear carpetas para cada tess que almacene estos archivos que luego el script 3 actualizara con lo.s datos de los trades que cerro, por lo que tendira que ir a buscar a ese lugar especifico, se me ocurre tratar tambien los archivos a almacenar como variables que aparte del nmbre que ya tienen (account_pnl.csv y account_trades.csv) incluyan el nombre del test o algo extra para diferenciarlos y que asi se cree el nombre de la carpeta, no se que tan buena o posible sea esta estrategia
+
+estos son los codigos desplegados como function en gcp
+
+
+script 1
+
+#%%
+import time
+import math
+import sys
+from datetime import datetime, timezone, timedelta
+from typing import List, Tuple
+import os
+import ccxt
+import pandas as pd
+import numpy as np
+from io import StringIO
+from google.cloud import storage
+
+TIMEFRAME = '1h'
+LOOKBACK_DAYS = 30
+VOL_ROLL_HOURS = 240
+VOL_MIN_PERIODS = 120
+TOP_N_WEEKDAY = 40
+TOP_N_SUNMON = 30
+UNIVERSE_MAX = 180
+SLEEP_BETWEEN_REQ = 0.3
+SCRIPT_NAME = 'Final_1Script_Bybit_YN10k_GetList'
+
+# Google Cloud Storage configuration
+# Set this via environment variable GCS_BUCKET_NAME or update the default below
+GCS_BUCKET_NAME = os.environ.get('GCS_BUCKET_NAME', 'bucket-test2-30tokens-data')  # Update with your bucket name
+
+#%%
+def boot_exchange():
+    print("[boot_exchange] Initializing Bybit exchange...")
+    ex = ccxt.bybit({
+        "enableRateLimit": True,
+        "options": {"defaultType": "future"}
+    })
+    print("[boot_exchange] Exchange initialized successfully")
+    return ex
+
+def get_script_directory():
+    """
+    Get the directory where this script is located.
+    Works for both regular Python scripts and Jupyter notebooks.
+    """
+    try:
+        # For regular Python scripts, __file__ is available
+        script_path = os.path.abspath(__file__)
+        return os.path.dirname(script_path)
+    except NameError:
+        # For Jupyter notebooks or interactive Python, __file__ is not available
+        # Use current working directory as fallback
+        return os.getcwd()
+
+
+def write_csv_to_gcs(df: pd.DataFrame, gcs_blob_name: str, bucket_name: str = GCS_BUCKET_NAME) -> str:
+    """
+    Write a pandas DataFrame to Google Cloud Storage as CSV.
+    Overwrites existing file if it exists.
+    
+    Args:
+        df: DataFrame to write
+        gcs_blob_name: Name/path for the file in GCS bucket
+        bucket_name: Name of the GCS bucket
+        
+    Returns:
+        Full GCS path (gs://bucket_name/blob_name)
+    """
+    try:
+        print(f"[write_csv_to_gcs] Writing DataFrame to gs://{bucket_name}/{gcs_blob_name}")
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(gcs_blob_name)
+        
+        # Convert DataFrame to CSV string
+        csv_string = df.to_csv(index=False)
+        
+        # Upload to GCS
+        blob.upload_from_string(csv_string, content_type='text/csv')
+        
+        gcs_path = f"gs://{bucket_name}/{gcs_blob_name}"
+        print(f"[write_csv_to_gcs] Successfully wrote {len(df)} rows to {gcs_path}")
+        return gcs_path
+    except Exception as e:
+        print(f"[write_csv_to_gcs] ERROR writing to GCS: {type(e).__name__}: {e}", file=sys.stderr)
+        raise
+
+
+#%%
+def load_universe(exchange, max_symbols: int = UNIVERSE_MAX) -> List[str]:
+    print(f"[load_universe] Loading markets (max_symbols={max_symbols})...")
+    markets = exchange.load_markets()
+    print(f"[load_universe] Loaded {len(markets)} total markets")
+    symbols_meta: List[Tuple[str, dict]] = []
+    for symbol, meta in markets.items():
+        if meta.get('contract') and meta.get('linear') and meta.get('active', True):
+            if meta.get('quote') == 'USDT':
+                symbols_meta.append((symbol, meta))
+    print(f"[load_universe] Found {len(symbols_meta)} USDT linear futures contracts")
+    try:
+        print("[load_universe] Fetching tickers to sort by volume...")
+        tickers = exchange.fetch_tickers()
+        vol_map = {k: v.get('quoteVolume', 0) or v.get('baseVolume', 0) for k, v in tickers.items()}
+        symbols_meta.sort(key=lambda kv: vol_map.get(kv[0], 0), reverse=True)
+        print(f"[load_universe] Sorted by volume. Top 5: {[s[0] for s in symbols_meta[:5]]}")
+    except Exception as e:
+        print(f"[load_universe] Warning: Could not fetch tickers ({type(e).__name__}), sorting alphabetically")
+        symbols_meta.sort(key=lambda kv: kv[0])
+    result = [s for s, _ in symbols_meta[:max_symbols]]
+    print(f"[load_universe] Returning {len(result)} symbols")
+    return result
+
+
+#%%
+ex = boot_exchange()
+
+
+universe = load_universe(ex)
+len(universe), universe[:10]
+#%%
+def fetch_ohlcv_symbol(exchange, symbol: str, timeframe: str = TIMEFRAME, days: int = LOOKBACK_DAYS,
+                        sleep: float = SLEEP_BETWEEN_REQ) -> pd.DataFrame:
+    print(f"[fetch_ohlcv_symbol] Fetching {symbol} ({timeframe}, {days} days)...")
+    since_ms = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+    since_dt = datetime.fromtimestamp(since_ms / 1000, tz=timezone.utc)
+    print(f"[fetch_ohlcv_symbol] {symbol}: Starting from {since_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    all_rows = []
+    limit = 1500
+    cursor = since_ms
+    batch_num = 0
+    while True:
+        batch_num += 1
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=cursor, limit=limit)
+            
+        except ccxt.RateLimitExceeded:
+            print(f"[fetch_ohlcv_symbol] {symbol}: Rate limit exceeded, waiting...")
+            time.sleep(max(sleep * 2, 1.0))
+            continue
+        except Exception as e:
+            print(f"[fetch_ohlcv_symbol] {symbol}: Error fetching data ({type(e).__name__}): {e}")
+            break
+        if not ohlcv:
+            print(f"[fetch_ohlcv_symbol] {symbol}: No more data available")
+            break
+        all_rows.extend(ohlcv)
+        last_t = ohlcv[-1][0]
+        last_dt = datetime.fromtimestamp(last_t / 1000, tz=timezone.utc)
+        print(f"[fetch_ohlcv_symbol] {symbol}: Batch {batch_num}: got {len(ohlcv)} candles, last: {last_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        next_t = last_t + exchange.parse_timeframe(timeframe) * 1000
+        if next_t <= cursor or len(ohlcv) < limit:
+            break
+        cursor = next_t
+        time.sleep(sleep)
+    if not all_rows:
+        print(f"[fetch_ohlcv_symbol] {symbol}: No data retrieved, returning empty DataFrame")
+        return pd.DataFrame(columns=['ts', 'open', 'high', 'low', 'close', 'volume', 'symbol'])
+    df = pd.DataFrame(all_rows, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
+    df['ts'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
+    df['symbol'] = symbol
+    print(f"[fetch_ohlcv_symbol] {symbol}: Successfully fetched {len(df)} candles (from {df['ts'].min()} to {df['ts'].max()})")
+    return df
+#%%
+
+def fetch_ohlcv_universe(exchange, symbols: List[str]) -> pd.DataFrame:
+    print(f"[fetch_ohlcv_universe] Starting to fetch OHLCV for {len(symbols)} symbols...")
+    frames = []
+    for i, sym in enumerate(symbols, 1):
+        print(f"[fetch_ohlcv_universe] Progress: {i}/{len(symbols)} - Processing {sym}")
+        df = fetch_ohlcv_symbol(exchange, sym)
+        if not df.empty:
+            frames.append(df)
+            print(f"[fetch_ohlcv_universe] {sym}: Added {len(df)} rows (total frames: {len(frames)})")
+        else:
+            print(f"[fetch_ohlcv_universe] {sym}: Skipped (empty DataFrame)")
+    print(f"[fetch_ohlcv_universe] Concatenating {len(frames)} dataframes...")
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not out.empty:
+        print(f"[fetch_ohlcv_universe] Before deduplication: {len(out)} rows, {out['symbol'].nunique()} unique symbols")
+        out['ts'] = out['ts'].dt.floor('h')
+        out = out.drop_duplicates(subset=['symbol', 'ts']).sort_values(['symbol', 'ts'])
+        print(f"[fetch_ohlcv_universe] After deduplication: {len(out)} rows, {out['symbol'].nunique()} unique symbols")
+        print(f"[fetch_ohlcv_universe] Time range: {out['ts'].min()} to {out['ts'].max()}")
+    else:
+        print("[fetch_ohlcv_universe] Warning: No data fetched for any symbol!")
+    return out
+
+
+def add_time_fields(df: pd.DataFrame) -> pd.DataFrame:
+    print(f"[add_time_fields] Adding time fields to {len(df)} rows...")
+    d = df.copy()
+    d['date'] = d['ts'].dt.floor('D')
+    d['weekday'] = d['ts'].dt.weekday
+    d['hour'] = d['ts'].dt.hour
+    iso = d['ts'].dt.isocalendar()
+    d['iso_year'] = iso['year'].astype(int)
+    d['iso_week'] = iso['week'].astype(int)
+    print(f"[add_time_fields] Added time fields. Date range: {d['date'].min()} to {d['date'].max()}")
+    print(f"[add_time_fields] Weekdays present: {sorted(d['weekday'].unique())}, Hours present: {sorted(d['hour'].unique())}")
+    return d
+
+
+def compute_sigma_daily(df: pd.DataFrame, vol_roll: int = VOL_ROLL_HOURS, minp: int = VOL_MIN_PERIODS) -> pd.DataFrame:
+    print(f"[compute_sigma_daily] Computing daily volatility (roll={vol_roll}h, min_periods={minp})...")
+    d = df.copy()
+    d['log_close'] = np.log(d['close'].astype(float))
+    d['ret1h'] = d.groupby('symbol')['log_close'].diff()
+    sigma_h = d.groupby('symbol')['ret1h'].transform(lambda s: s.rolling(vol_roll, min_periods=minp).std()).shift(1)
+    d['sigma_daily'] = sigma_h * np.sqrt(24)
+    valid_sigma = d['sigma_daily'].notna().sum()
+    print(f"[compute_sigma_daily] Computed sigma_daily: {valid_sigma}/{len(d)} valid values")
+    if valid_sigma > 0:
+        print(f"[compute_sigma_daily] Sigma stats: min={d['sigma_daily'].min():.6f}, max={d['sigma_daily'].max():.6f}, median={d['sigma_daily'].median():.6f}")
+    return d
+
+
+def latest_complete_weekday_date(df: pd.DataFrame) -> pd.Timestamp:
+    print("[latest_complete_weekday_date] Finding latest complete weekday...")
+    d = df[(df['weekday'] < 5)]
+    print(f"[latest_complete_weekday_date] Filtered to {len(d)} weekday rows")
+    have23 = d[d['hour'] == 23]['date'].max()
+    if pd.isna(have23):
+        print("[latest_complete_weekday_date] Warning: No complete weekday found (no hour 23 data)")
+    else:
+        print(f"[latest_complete_weekday_date] Latest complete weekday: {have23}")
+    return have23
+
+
+def friday_of_last_week(df: pd.DataFrame) -> pd.Timestamp:
+    print("[friday_of_last_week] Finding Friday of last complete week...")
+    fridays = df[df['weekday'] == 4]
+    print(f"[friday_of_last_week] Found {len(fridays)} Friday rows")
+    friday_date = fridays['date'].max()
+    if pd.isna(friday_date):
+        print("[friday_of_last_week] Warning: No Friday found in data")
+    else:
+        print(f"[friday_of_last_week] Last Friday: {friday_date}")
+    return friday_date
+
+
+def weekday_top_list(df: pd.DataFrame, date_ref: pd.Timestamp, top_n: int = TOP_N_WEEKDAY) -> pd.DataFrame:
+    print(f"[weekday_top_list] Computing top {top_n} for weekday {date_ref}...")
+    day = df[df['date'] == date_ref].copy()
+    print(f"[weekday_top_list] Found {len(day)} rows for date {date_ref}, {day['symbol'].nunique()} unique symbols")
+    op = day[day['hour'] == 0].sort_values('ts').groupby('symbol', as_index=False).first()[['symbol', 'ts', 'close']].rename(columns={'ts': 'ts_open', 'close': 'px_open'})
+    print(f"[weekday_top_list] Opening prices: {len(op)} symbols with hour 0 data")
+    cl = day[day['hour'] == 23].sort_values('ts').groupby('symbol', as_index=False).last()[['symbol', 'ts', 'close', 'sigma_daily']].rename(columns={'ts': 'ts_23', 'close': 'px_23', 'sigma_daily': 'sigma_entry'})
+    print(f"[weekday_top_list] Closing prices: {len(cl)} symbols with hour 23 data")
+    tab = cl.merge(op, on='symbol', how='inner')
+    if tab.empty:
+        print("[weekday_top_list] Warning: No symbols with both opening and closing prices")
+        return tab
+    print(f"[weekday_top_list] Merged table: {len(tab)} symbols with both open and close")
+    tab['ret_day'] = tab['px_23'] / tab['px_open'] - 1.0
+    pos = tab[tab['ret_day'] > 0].copy()
+    if pos.empty:
+        print("[weekday_top_list] Warning: No positive returns found")
+        return pos
+    print(f"[weekday_top_list] Positive returns: {len(pos)} symbols")
+    med = pos['ret_day'].median()
+    print(f"[weekday_top_list] Median positive return: {med:.6f}")
+    pos['ret_excess'] = pos['ret_day'] - med
+    pos['sigma_entry'] = pos['sigma_entry'].replace([0, np.inf, -np.inf], np.nan)
+    pos['sigma_entry'] = pos['sigma_entry'].fillna(pos['sigma_entry'].median())
+    eps = 1e-12
+    pos['score'] = pos['ret_excess'] / np.maximum(pos['sigma_entry'], eps)
+    pos = pos.sort_values('score', ascending=False)
+    result = pos.head(top_n)[['symbol', 'score', 'ret_day', 'ret_excess', 'sigma_entry', 'ts_23']].reset_index(drop=True)
+    print(f"[weekday_top_list] Returning top {len(result)} symbols")
+    if len(result) > 0:
+        print(f"[weekday_top_list] Top 5: {result.head(5)[['symbol', 'score']].to_dict('records')}")
+    return result
+
+
+def sunmon_top_list(df: pd.DataFrame, friday_date: pd.Timestamp, top_n: int = TOP_N_SUNMON) -> pd.DataFrame:
+    print(f"[sunmon_top_list] Computing top {top_n} for Thu-Fri week ending {friday_date}...")
+    week_start = friday_date - pd.Timedelta(days=6)
+    wk = df[df['date'].between(week_start, friday_date)].copy()
+    if wk.empty:
+        print(f"[sunmon_top_list] Warning: No data for week {week_start} to {friday_date}")
+        return wk
+    print(f"[sunmon_top_list] Week data: {len(wk)} rows, {wk['symbol'].nunique()} unique symbols")
+    thu = wk[wk['weekday'] == 3].sort_values('ts').groupby('symbol', as_index=False).last()[['symbol', 'ts', 'close']].rename(columns={'ts': 'thu_ts', 'close': 'thu_px'})
+    print(f"[sunmon_top_list] Thursday prices: {len(thu)} symbols")
+    fri = wk[wk['weekday'] == 4].sort_values('ts').groupby('symbol', as_index=False).last()[['symbol', 'ts', 'close', 'sigma_daily']].rename(columns={'ts': 'fri_ts', 'close': 'fri_px', 'sigma_daily': 'sigma_fri'})
+    print(f"[sunmon_top_list] Friday prices: {len(fri)} symbols")
+    tab = fri.merge(thu, on='symbol', how='inner')
+    if tab.empty:
+        print("[sunmon_top_list] Warning: No symbols with both Thursday and Friday prices")
+        return tab
+    print(f"[sunmon_top_list] Merged table: {len(tab)} symbols with both Thu and Fri")
+    tab['fri_ret'] = tab['fri_px'] / tab['thu_px'] - 1.0
+    pos = tab[tab['fri_ret'] > 0].copy()
+    if pos.empty:
+        print("[sunmon_top_list] Warning: No positive Friday returns found")
+        return pos
+    print(f"[sunmon_top_list] Positive Friday returns: {len(pos)} symbols")
+    med = pos['fri_ret'].median()
+    print(f"[sunmon_top_list] Median positive Friday return: {med:.6f}")
+    pos['fri_excess'] = pos['fri_ret'] - med
+    pos['sigma_fri'] = pos['sigma_fri'].replace([0, np.inf, -np.inf], np.nan).fillna(pos['sigma_fri'].median())
+    eps = 1e-12
+    pos['score'] = pos['fri_excess'] / np.maximum(pos['sigma_fri'], eps)
+    pos = pos.sort_values('score', ascending=False)
+    result = pos.head(top_n)[['symbol', 'score', 'fri_ret', 'fri_excess', 'sigma_fri', 'fri_ts']].reset_index(drop=True)
+    print(f"[sunmon_top_list] Returning top {len(result)} symbols")
+    if len(result) > 0:
+        print(f"[sunmon_top_list] Top 5: {result.head(5)[['symbol', 'score']].to_dict('records')}")
+    return result
+
+
+def run_screener_bybit(universe_max: int = UNIVERSE_MAX, top_n_weekday: int = TOP_N_WEEKDAY, top_n_sunmon: int = TOP_N_SUNMON, save_to_gcs: bool = True, bucket_name: str = GCS_BUCKET_NAME):
+    print("=" * 80)
+    print(f"[run_screener_bybit] Starting screener (universe_max={universe_max}, top_n_weekday={top_n_weekday}, top_n_sunmon={top_n_sunmon})")
+    print("=" * 80)
+    
+    ex = boot_exchange()
+    universe = load_universe(ex, max_symbols=universe_max)
+    print(f"[run_screener_bybit] Universe loaded: {len(universe)} symbols")
+    
+    raw = fetch_ohlcv_universe(ex, universe)
+    if raw.empty:
+        print("[run_screener_bybit] ERROR: No OHLCV data retrieved!")
+        return {
+            'weekday': pd.DataFrame(),
+            'sunmon': pd.DataFrame(),
+            'ref_day': None,
+            'friday': None
+        }
+    print(f"[run_screener_bybit] OHLCV data: {len(raw)} rows")
+    
+    print("\n[run_screener_bybit] Processing data...")
+    df = add_time_fields(raw)
+    df = compute_sigma_daily(df)
+    print(f"[run_screener_bybit] Processed data: {len(df)} rows, {df['symbol'].nunique()} symbols")
+
+    print("\n[run_screener_bybit] Computing weekday top list...")
+    ref_day = latest_complete_weekday_date(df)
+    if ref_day is None:
+        print("[run_screener_bybit] WARNING: No reference day found, skipping weekday top list")
+        weekday_tab = pd.DataFrame()
+    else:
+        weekday_tab = weekday_top_list(df, ref_day, top_n=top_n_weekday)
+        print(f"[run_screener_bybit] Weekday top list: {len(weekday_tab)} results")
+
+    print("\n[run_screener_bybit] Computing Sun/Mon top list...")
+    weekday_now = datetime.now(timezone.utc).weekday()
+    print(f"[run_screener_bybit] Current weekday: {weekday_now} (0=Monday, 6=Sunday)")
+    friday_date = friday_of_last_week(df)
+    if friday_date is None:
+        print("[run_screener_bybit] WARNING: No Friday found, skipping Sun/Mon top list")
+        sunmon_tab = pd.DataFrame()
+    else:
+        sunmon_tab = sunmon_top_list(df, friday_date, top_n=top_n_sunmon)
+        print(f"[run_screener_bybit] Sun/Mon top list: {len(sunmon_tab)} results")
+
+    print("\n" + "=" * 80)
+    print("[run_screener_bybit] SUMMARY:")
+    print(f"  - Reference day: {ref_day}")
+    print(f"  - Last Friday: {friday_date}")
+    print(f"  - Weekday results: {len(weekday_tab)} symbols")
+    print(f"  - Sun/Mon results: {len(sunmon_tab)} symbols")
+    print("=" * 80 + "\n")
+
+    # Save weekday results to GCS if requested and data exists
+    if save_to_gcs and not weekday_tab.empty:
+        try:
+            print(f"\n[run_screener_bybit] Saving weekday results to GCS...")
+            # Save dated version
+            csv_blob_date = f'weekday_bybit_{datetime.now().strftime("%Y-%m-%d")}.csv'
+            gcs_path_date = write_csv_to_gcs(weekday_tab, csv_blob_date, bucket_name)
+            print(f"[run_screener_bybit] Saved dated version: {gcs_path_date}")
+            
+            # Save latest version (this is what the trade execution script reads)
+            csv_blob_latest = 'weekday_bybit_latest.csv'
+            gcs_path_latest = write_csv_to_gcs(weekday_tab, csv_blob_latest, bucket_name)
+            print(f"[run_screener_bybit] Saved latest version: {gcs_path_latest}")
+            print(f"[run_screener_bybit] Total rows saved: {len(weekday_tab)}")
+        except Exception as e:
+            print(f"[run_screener_bybit] WARNING: Could not save to GCS: {type(e).__name__}: {e}")
+            print(f"[run_screener_bybit] Results are still returned, but CSV was not saved to GCS")
+
+    return {
+        'weekday': weekday_tab,
+        'sunmon': sunmon_tab,
+        'ref_day': ref_day,
+        'friday': friday_date,
+    }
+
+# %%
+result = run_screener_bybit()
+# %%
+print("\n[SCRIPT] Weekday results:")
+print(result['weekday'])
+print("\n[SCRIPT] Sun/Mon results:")
+print(result['sunmon'])
+# %%
+result_df = result['weekday']
+print(f"\n[SCRIPT] Saving weekday results to CSV...")
+
+# Save to Google Cloud Storage
+try:
+    # Save dated version
+    csv_blob_date = f'weekday_bybit_{datetime.now().strftime("%Y-%m-%d")}.csv'
+    gcs_path_date = write_csv_to_gcs(result_df, csv_blob_date, GCS_BUCKET_NAME)
+    print(f"[SCRIPT] Saved dated version: {gcs_path_date}")
+    
+    # Save latest version
+    csv_blob_latest = 'weekday_bybit_latest.csv'
+    gcs_path_latest = write_csv_to_gcs(result_df, csv_blob_latest, GCS_BUCKET_NAME)
+    print(f"[SCRIPT] Saved latest version: {gcs_path_latest}")
+    print(f"[SCRIPT] Total rows saved: {len(result_df)}")
+except Exception as e:
+    print(f"[SCRIPT] ERROR saving to GCS: {type(e).__name__}: {e}")
+    # Fallback to local filesystem if GCS fails (for local testing)
+    print("[SCRIPT] Falling back to local filesystem...")
+    script_dir = get_script_directory()
+    csv_path_date = os.path.join(script_dir, f'weekday_bybit_{datetime.now().strftime("%Y-%m-%d")}.csv')
+    result_df.to_csv(csv_path_date)
+    print(f"[SCRIPT] Saved locally: {csv_path_date}")
+    csv_path_latest = os.path.join(script_dir, 'weekday_bybit_latest.csv')
+    result_df.to_csv(csv_path_latest)
+    print(f"[SCRIPT] Saved locally: {csv_path_latest}")
+
+# %%
+
+script 2
+
+import pandas as pd
+import ccxt
+import time
+import os
+import sys
+from datetime import datetime, timezone
+import json
+import math
+import pprint
+import A1_Get_bybitList as get_bybit_list
+import functions_framework
+from google.cloud import storage
+from io import StringIO
+
+
+CSV_FILE = 'weekday_bybit_latest.csv'
+CSV_ACCOUNT_PNL = 'account_pnl.csv'
+CSV_ACCOUNT_TRADES = 'account_trades.csv'
+CSV_ACCOUNT_POSITIONS = 'account_positions_final.csv'
+SCRIPT_NAME = 'Final_2A_Script_Bybit_YN10k_ExecuteTrades_Professional'
+SCRIPT_NAME_SHORT = 'Trade_Execution'
+
+TOP_N = 30  # Number of symbols to trade
+ORDER_SIZE = 0.1  # Contract size per symbol (adjust based on your capital and risk)
+SLEEP_BETWEEN_ORDERS = 0.5  # Sleep time between orders to avoid rate limits
+SLEEP_BETWEEN_SYMBOLS = 1.0  # Additional sleep between processing different symbols
+LEVERAGE_FOR_ORDERS = 1  # Leverage for orders
+LEVERAGE_FOR_SYMBOLS = 3  # Leverage for symbols
+
+# Rate limiting constants
+RATE_LIMIT_DELAY = 0.1  # Minimum delay between API calls
+RETRY_DELAY_BASE = 1.0  # Base delay for retries
+MAX_RETRIES = 3  # Maximum retries for API calls
+
+# API Credentials for Bybit Testnet/Demo
+# Get your testnet API keys from: https://testnet.bybit.com/
+API_KEY = "oNZyTs1IiwoUzxrQoS"  # Set your testnet API key here (or use environment variable)
+API_SECRET = 'rGTHocjMqekaoLqTb3LVFyb6dPYJVXm0J2QF'  # Set your testnet API secret here (or use environment variable)
+
+# Google Cloud Storage configuration
+# Set this via environment variable GCS_BUCKET_NAME or update the default below
+GCS_BUCKET_NAME = os.environ.get('GCS_BUCKET_NAME', 'bucket-test2-30tokens-data')  # Update with your bucket name
+
+
+
+#FUNCTION TO DECLARE EXCHANGE
+def boot_exchange_demo():
+    """Initialize Bybit demo/testnet exchange"""
+    config = {
+        "enableRateLimit": True,
+        "options": {"defaultType": "future"}
+    }
+
+    # Add API credentials if provided
+    api_key = API_KEY or None
+    api_secret = API_SECRET or None
+
+    if api_key and api_secret:
+        config["apiKey"] = api_key
+        config["secret"] = api_secret
+
+    ex = ccxt.bybit(config)
+    #ex.set_sandbox_mode(True)  # Enable demo/testnet mode
+    ex.enable_demo_trading(True)
+    return ex
+
+## CSV LOGGING FUNCTIONS
+
+def get_script_directory():
+    """
+    Get the directory where this script is located.
+    Works for both regular Python scripts and Jupyter notebooks.
+    """
+    try:
+        # For regular Python scripts, __file__ is available
+        script_path = os.path.abspath(__file__)
+        return os.path.dirname(script_path)
+    except NameError:
+        # For Jupyter notebooks or interactive Python, __file__ is not available
+        # Use current working directory as fallback
+        return os.getcwd()
+
+
+def log_account_balance_to_csv(exchange, csv_file: str = CSV_ACCOUNT_PNL, bucket_name: str = GCS_BUCKET_NAME):
+    """
+    Fetch account balance and log to CSV file in Google Cloud Storage.
+    Creates file with headers if it doesn't exist, appends if it does.
+    Always preserves existing data by reading, appending, then writing back.
+    """
+    try:
+        # Fetch balance with rate limiting
+        time.sleep(RATE_LIMIT_DELAY)
+        balance_data = exchange.fetchBalance()
+        
+        # Extract relevant balance information
+        timestamp = datetime.now(timezone.utc)
+        
+        # Prepare record with timestamp and all balance info
+        record = {
+            'timestamp': timestamp.isoformat(),
+            'timestamp_utc': timestamp.strftime('%Y-%m-%d %H:%M:%S UTC'),
+            'date': timestamp.strftime('%Y-%m-%d'),
+            'time': timestamp.strftime('%H:%M:%S'),
+            'script_name': SCRIPT_NAME_SHORT,
+        }
+        
+        # Add all currencies from the balance
+        if 'free' in balance_data:
+            for currency, value in balance_data['free'].items():
+                record[f'free_{currency}'] = value
+                
+        if 'used' in balance_data:
+            for currency, value in balance_data['used'].items():
+                record[f'used_{currency}'] = value
+                
+        if 'total' in balance_data:
+            for currency, value in balance_data['total'].items():
+                record[f'total_{currency}'] = value
+                
+        # Add info if available
+        if 'info' in balance_data:
+            record['info'] = json.dumps(balance_data['info']) if balance_data['info'] else None
+        
+        # Create DataFrame from new record
+        df_new = pd.DataFrame([record])
+        
+        # Write to GCS (write_csv_to_gcs handles appending if file exists)
+        gcs_path = write_csv_to_gcs(df_new, csv_file, bucket_name)
+        print(f"[log_account_balance] Logged balance record to {gcs_path}")
+            
+        return record
+        
+    except Exception as e:
+        print(f"[log_account_balance] Error logging balance: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def log_trade_to_csv(order_data, symbol: str, order_type: str, csv_file: str = CSV_ACCOUNT_TRADES, bucket_name: str = GCS_BUCKET_NAME):
+    """
+    Log trade details to CSV file in Google Cloud Storage.
+    Creates file with headers if it doesn't exist, appends if it does.
+    Always preserves existing data by reading, appending, then writing back.
+    """
+    try:
+        # Prepare timestamp
+        timestamp = datetime.now(timezone.utc)
+        
+        # Extract order information
+        record = {
+            'timestamp': timestamp.isoformat(),
+            'timestamp_utc': timestamp.strftime('%Y-%m-%d %H:%M:%S UTC'),
+            'date': timestamp.strftime('%Y-%m-%d'),
+            'time': timestamp.strftime('%H:%M:%S'),
+            'symbol': symbol,
+            'order_type': order_type,  # 'market', 'limit', etc.
+            'side': order_data.get('side', 'N/A'),
+            'order_id': order_data.get('id', 'N/A'),
+            'status': order_data.get('status', 'N/A'),
+            'amount': order_data.get('amount', None),
+            'filled': order_data.get('filled', 0),
+            'remaining': order_data.get('remaining', None),
+            'price': order_data.get('price', None),
+            'average': order_data.get('average', None),
+            'cost': order_data.get('cost', None),
+            
+        }
+        
+        # Extract additional info from nested structure if available
+        if 'info' in order_data and order_data['info']:
+            info = order_data['info']
+            # Try to extract more details from info
+            if isinstance(info, dict):
+                record['order_id_exchange'] = info.get('orderId', info.get('order_id', 'N/A'))
+                record['avg_price'] = info.get('avgPrice', info.get('avg_price', None))
+                record['executed_qty'] = info.get('executedQty', info.get('executed_qty', None))
+                record['cum_exec_qty'] = info.get('cumExecQty', info.get('cum_exec_qty', None))
+                record['order_status'] = info.get('orderStatus', info.get('order_status', None))
+                record['create_time'] = info.get('createTime', info.get('create_time', None))
+                record['update_time'] = info.get('updateTime', info.get('update_time', None))
+                
+                
+                # Store full info as JSON for reference
+                record['info_json'] = json.dumps(info) if info else None
+        
+        # Create DataFrame from new record
+        df_new = pd.DataFrame([record])
+        
+        # Write to GCS (write_csv_to_gcs handles appending if file exists)
+        gcs_path = write_csv_to_gcs(df_new, csv_file, bucket_name)
+        print(f"[log_trade] Logged trade record for {symbol} to {gcs_path}")
+            
+        return record
+        
+    except Exception as e:
+        print(f"[log_trade] Error logging trade: {str(e)}")
+        print(f"[log_trade] Order data: {order_data}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+
+## HELPER FUNCTIONS WITH RETRY LOGIC
+
+def api_call_with_retry(func, *args, **kwargs):
+    """
+    Execute an API call with retry logic and rate limiting.
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            time.sleep(RATE_LIMIT_DELAY)
+            return func(*args, **kwargs)
+        except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+            if attempt < MAX_RETRIES - 1:
+                wait_time = RETRY_DELAY_BASE * (2 ** attempt)  # Exponential backoff
+                print(f"[api_call_with_retry] Attempt {attempt + 1} failed: {str(e)}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                print(f"[api_call_with_retry] All {MAX_RETRIES} attempts failed for {func.__name__}")
+                raise
+        except Exception as e:
+            # For non-network errors, don't retry
+            print(f"[api_call_with_retry] Non-retryable error in {func.__name__}: {str(e)}")
+            raise
+
+## LOAD SYMBOLS FROM CSV FILE
+
+def load_top_symbols(csv_file: str, top_n: int = TOP_N, bucket_name: str = GCS_BUCKET_NAME) -> list:
+    """Load top N symbols from CSV file in Google Cloud Storage"""
+    try:
+        # Read CSV from GCS
+        df = read_csv_from_gcs(csv_file, bucket_name)
+        symbols = df['symbol'].head(top_n).tolist()
+        return symbols
+    except Exception as e:
+        print(f"[load_top_symbols] Error loading symbols from GCS: {str(e)}")
+        raise
+
+## FUNCTIONS TO PROCESS MARKET DATA
+
+def convert_numeric_string(value):
+    """
+    Convert numeric string to appropriate numeric type while preserving precision.
+    Handles integers, floats, and scientific notation.
+    Always returns a number (int or float), never a string.
+    """
+    if isinstance(value, (int, float)):
+        return value
+    elif isinstance(value, str) and value.strip():
+        try:
+            if '.' not in value and 'e' not in value.lower() and 'E' not in value:
+                try:
+                    return int(value)
+                except ValueError:
+                    pass
+            return float(value)
+        except (ValueError, TypeError):
+            return value
+    return value
+
+def flatten_market_item(item: dict, parent_key: str = '', sep: str = '_') -> dict:
+    """
+    Flatten a market item dictionary, converting nested structures to flat columns.
+    Converts numeric strings to numbers while preserving precision.
+    All keys are lowercase.
+    """
+    flattened = {}
+    for k, v in item.items():
+        new_key = f"{parent_key}{sep}{k.lower()}" if parent_key else k.lower()
+        if isinstance(v, dict):
+            nested = flatten_market_item(v, new_key, sep=sep)
+            flattened.update(nested)
+        elif isinstance(v, list):
+            flattened[new_key] = str(v) if len(str(v)) < 100 else str(v)[:100] + '...'
+        elif v is None:
+            flattened[new_key] = None
+        elif isinstance(v, str):
+            numeric_val = convert_numeric_string(v)
+            flattened[new_key] = numeric_val
+        else:
+            flattened[new_key] = v
+    return flattened
+
+def markets_to_dataframe(markets_list: list) -> pd.DataFrame:
+    """
+    Convert list of market dictionaries to a flattened DataFrame.
+    Preserves numeric precision, expands nested structures, all lowercase columns.
+    """
+    flattened_items = []
+    for item in markets_list:
+        flattened = flatten_market_item(item)
+        flattened_items.append(flattened)
+    
+    df = pd.DataFrame(flattened_items)
+    df.columns = [col.lower() if isinstance(col, str) else str(col).lower() for col in df.columns]
+    return df
+
+## GET TOKEN INFO FUNCTION
+def get_token_info(symbol: str, markets_df: pd.DataFrame) -> dict:
+    """Get market info for a specific token"""
+    token_row = markets_df[markets_df['symbol'] == symbol]
+    if not token_row.empty:
+        return token_row.iloc[0].to_dict()
+    else:
+        return {'error': f'Symbol {symbol} not found'}
+
+## SET LEVERAGE FOR EACH SYMBOL (with smart error handling)
+def set_leverage_smart(exchange, leverage: int, symbol: str) -> bool:
+    """
+    Set leverage for a symbol, treating 'already set' errors as success.
+    Returns True if successful or already set, False on actual error.
+    """
+    try:
+        time.sleep(RATE_LIMIT_DELAY)
+        exchange.setLeverage(leverage, symbol)
+        return True
+    except Exception as e:
+        error_str = str(e).lower()
+        error_msg = str(e)
+        
+        # Check if error indicates leverage is already set (not modified)
+        # Common Bybit error messages: "not modified", "same value", "already", etc.
+        if any(keyword in error_str for keyword in [
+            'not modified', 'not change', 'no change', 'same value',
+            'already set', 'already', 'unchanged', 'identical'
+        ]):
+            # Leverage is already set correctly - this is success, not an error
+            return True
+        else:
+            # Actual error - re-raise it
+            raise
+
+## HELPER FUNCTIONS FOR TRADING
+
+def get_best_bid_ask(symbol: str, exchange: ccxt.Exchange) -> tuple:
+    """Get the best bid and ask for a symbol with rate limiting"""
+    ticker = api_call_with_retry(exchange.fetchTicker, symbol)
+    return ticker['bid'], ticker['ask']
+
+
+def place_short_mk_order_professional(exchange, symbol: str, size_per_symbol: float, markets_df: pd.DataFrame, all_orders_to_fetch: list):
+    """
+    Place market sell order(s) for the given symbol, respecting max order size limits.
+    Returns list of order objects.
+    """
+    try:
+        print(f"\n[PLACE_ORDER] Processing {symbol}...")
+        
+        # Get current bid/ask
+        bid, ask = get_best_bid_ask(symbol, exchange)
+        print(f"  Current bid: {bid}, ask: {ask}")
+        
+        # Calculate contract amount
+        contracts_amount = size_per_symbol / ask
+        print(f"  Target size: {size_per_symbol:.2f} USDT")
+        print(f"  Contracts to sell: {contracts_amount:.6f}")
+        
+        # Get max market order quantity
+        token_info = get_token_info(symbol, markets_df)
+        max_market_order_quantity = token_info.get('info_lotsizefilter_maxmktorderqty')
+        
+        # Handle None or NaN values - use max_order_qty as fallback, then limits_amount_max
+        if max_market_order_quantity is None or pd.isna(max_market_order_quantity):
+            max_market_order_quantity = token_info.get('info_lotsizefilter_maxorderqty')
+        if max_market_order_quantity is None or pd.isna(max_market_order_quantity):
+            max_market_order_quantity = token_info.get('limits_amount_max', float('inf'))
+        if max_market_order_quantity is None or pd.isna(max_market_order_quantity):
+            max_market_order_quantity = float('inf')  # No limit if not available
+        
+        print(f"  Max market order quantity: {max_market_order_quantity}")
+        
+        orders_placed = []
+        
+        # Check if we need to split the order
+        if contracts_amount > max_market_order_quantity:
+            # Split into multiple orders
+            num_parts = int(math.ceil(contracts_amount / max_market_order_quantity))
+            contracts_amount_per_part = contracts_amount / num_parts
+            
+            print(f"  ⚠ Contract size exceeds max order size")
+            print(f"  Splitting into {num_parts} orders of ~{contracts_amount_per_part:.6f} contracts each")
+            print(f"  ----------------------------------------")
+            
+            # Place multiple orders
+            for part_num in range(num_parts):
+                try:
+                    order = api_call_with_retry(
+                        exchange.create_market_order,
+                        symbol=symbol,
+                        side='sell',
+                        amount=contracts_amount_per_part
+                    )
+                    
+                    order_id = order.get('id')
+                    print(f"  ✓ Order {part_num + 1}/{num_parts} placed - ID: {order_id}")
+                    
+                    # Store for later fetching
+                    all_orders_to_fetch.append({
+                        'order_id': order_id,
+                        'symbol': symbol,
+                        'initial_order': order,
+                        'part': f"{part_num + 1}/{num_parts}"
+                    })
+                    
+                    orders_placed.append(order)
+                    
+                    # Rate limiting between orders
+                    if part_num < num_parts - 1:  # Don't sleep after last order
+                        time.sleep(SLEEP_BETWEEN_ORDERS)
+                        
+                except Exception as part_error:
+                    print(f"  ✗ Error placing part {part_num + 1} for {symbol}: {str(part_error)}")
+                    time.sleep(RATE_LIMIT_DELAY)
+            
+            print(f"  ----------------------------------------")
+            print(f"  ✓ All {num_parts} orders placed for {symbol}")
+            
+        else:
+            # Single order - within limits
+            print(f"  Contract size within limits, placing single order...")
+            
+            order = api_call_with_retry(
+                exchange.create_market_order,
+                symbol=symbol,
+                side='sell',
+                amount=contracts_amount
+            )
+            
+            order_id = order.get('id')
+            print(f"  ✓ Order placed - ID: {order_id}")
+            
+            # Store for later fetching
+            all_orders_to_fetch.append({
+                'order_id': order_id,
+                'symbol': symbol,
+                'initial_order': order,
+                'part': "1/1"
+            })
+            
+            orders_placed.append(order)
+        
+        return orders_placed
+        
+    except Exception as e:
+        print(f"  ✗ Error placing order for {symbol}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
+def read_csv_from_gcs(gcs_blob_name: str, bucket_name: str = GCS_BUCKET_NAME) -> pd.DataFrame:
+    """
+    Read a CSV file from Google Cloud Storage.
+    
+    Args:
+        gcs_blob_name: Name/path for the file in GCS bucket
+        bucket_name: Name of the GCS bucket
+        
+    Returns:
+        pandas DataFrame containing the CSV data
+        
+    Raises:
+        Exception if file doesn't exist or can't be read
+    """
+    try:
+        print(f"[read_csv_from_gcs] Reading gs://{bucket_name}/{gcs_blob_name}")
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(gcs_blob_name)
+        
+        # Check if blob exists
+        if not blob.exists():
+            raise FileNotFoundError(f"CSV file {gcs_blob_name} not found in bucket {bucket_name}")
+        
+        # Download blob content as string
+        csv_content = blob.download_as_text()
+        
+        # Read CSV from string
+        df = pd.read_csv(StringIO(csv_content))
+        print(f"[read_csv_from_gcs] Successfully read CSV with {len(df)} rows from gs://{bucket_name}/{gcs_blob_name}")
+        return df
+    except Exception as e:
+        print(f"[read_csv_from_gcs] ERROR reading from GCS: {type(e).__name__}: {e}", file=sys.stderr)
+        raise
+
+def write_csv_to_gcs(df: pd.DataFrame, gcs_blob_name: str, bucket_name: str = GCS_BUCKET_NAME) -> str:
+    """
+    Write a pandas DataFrame to Google Cloud Storage as CSV.
+    Appends to existing file if it exists, otherwise creates new file.
+    
+    Args:
+        df: DataFrame to write
+        gcs_blob_name: Name/path for the file in GCS bucket
+        bucket_name: Name of the GCS bucket
+        
+    Returns:
+        Full GCS path (gs://bucket_name/blob_name)
+    """
+    try:
+        print(f"[write_csv_to_gcs] Writing DataFrame to gs://{bucket_name}/{gcs_blob_name}")
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(gcs_blob_name)
+        
+        # Check if file exists
+        if blob.exists():
+            # Read existing CSV
+            try:
+                existing_csv = blob.download_as_text()
+                df_existing = pd.read_csv(StringIO(existing_csv))
+                # Combine with new data
+                df_combined = pd.concat([df_existing, df], ignore_index=True)
+                print(f"[write_csv_to_gcs] Appending to existing file (existing: {len(df_existing)} rows, new: {len(df)} rows)")
+            except Exception as read_error:
+                # If reading fails, just write new data
+                print(f"[write_csv_to_gcs] Warning: Could not read existing file, overwriting: {read_error}")
+                df_combined = df
+        else:
+            # Create new file
+            df_combined = df
+            print(f"[write_csv_to_gcs] Creating new file with {len(df)} rows")
+        
+        # Convert DataFrame to CSV string
+        csv_string = df_combined.to_csv(index=False)
+        
+        # Upload to GCS
+        blob.upload_from_string(csv_string, content_type='text/csv')
+        
+        gcs_path = f"gs://{bucket_name}/{gcs_blob_name}"
+        print(f"[write_csv_to_gcs] Successfully wrote {len(df_combined)} rows to {gcs_path}")
+        return gcs_path
+    except Exception as e:
+        print(f"[write_csv_to_gcs] ERROR writing to GCS: {type(e).__name__}: {e}", file=sys.stderr)
+        raise
+
+def upload_to_gcs(local_file_path: str, gcs_blob_name: str, bucket_name: str = GCS_BUCKET_NAME) -> str:
+    """
+    Upload a file from local filesystem to Google Cloud Storage.
+    
+    Args:
+        local_file_path: Path to the local file to upload
+        gcs_blob_name: Name/path for the file in GCS bucket
+        bucket_name: Name of the GCS bucket
+        
+    Returns:
+        Full GCS path (gs://bucket_name/blob_name)
+    """
+    try:
+        print(f"[upload_to_gcs] Uploading {local_file_path} to gs://{bucket_name}/{gcs_blob_name}")
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(gcs_blob_name)
+        
+        blob.upload_from_filename(local_file_path)
+        
+        gcs_path = f"gs://{bucket_name}/{gcs_blob_name}"
+        print(f"[upload_to_gcs] Successfully uploaded to {gcs_path}")
+        return gcs_path
+    except Exception as e:
+        print(f"[upload_to_gcs] ERROR uploading to GCS: {type(e).__name__}: {e}", file=sys.stderr)
+        raise
+
+def save_dataframe_to_gcs(df: pd.DataFrame, gcs_blob_name: str, bucket_name: str = GCS_BUCKET_NAME) -> str:
+    """
+    Save a pandas DataFrame to Google Cloud Storage via temporary local file.
+    
+    Args:
+        df: DataFrame to save
+        gcs_blob_name: Name/path for the file in GCS bucket
+        bucket_name: Name of the GCS bucket
+        
+    Returns:
+        Full GCS path (gs://bucket_name/blob_name)
+    """
+    # Save to /tmp/ first (this folder is writable in Cloud Functions)
+    temp_filename = f'/tmp/{os.path.basename(gcs_blob_name)}'
+    print(f"[save_dataframe_to_gcs] Saving DataFrame to temporary file: {temp_filename}")
+    df.to_csv(temp_filename, index=False)
+    print(f"[save_dataframe_to_gcs] File saved temporarily to {temp_filename}")
+    
+    # Upload to GCS
+    gcs_path = upload_to_gcs(temp_filename, gcs_blob_name, bucket_name)
+    
+    # Clean up temporary file
+    try:
+        os.remove(temp_filename)
+        print(f"[save_dataframe_to_gcs] Cleaned up temporary file: {temp_filename}")
+    except Exception as e:
+        print(f"[save_dataframe_to_gcs] Warning: Could not remove temp file: {e}")
+    
+    return gcs_path
+
+    
+
+@functions_framework.http
+def run_script_one(request):
+    """
+    Google Cloud Functions HTTP entry point.
+    This function is called when the Cloud Function is triggered via HTTP.
+    """
+    try:
+        print(f"[run_script_one] Cloud Function triggered at {datetime.now(timezone.utc).isoformat()}")
+        print(f"[run_script_one] Using GCS bucket: {GCS_BUCKET_NAME}")
+        
+        
+       # Get the bybit list
+        bybit_list = get_bybit_list.run_screener_bybit()
+        print(bybit_list) 
+
+        # ACTIVATING VARIABLE
+        ex = boot_exchange_demo()
+
+        ## GET MARKET DATA AND PROCESS IT
+
+        print("="*80)
+        print("[EXECUTE_TRADES] Loading symbols and market data...")
+        print("="*80)
+
+        symbols_to_trade = load_top_symbols(CSV_FILE, TOP_N)
+        print(f"[EXECUTE_TRADES] Loaded {len(symbols_to_trade)} symbols to trade: {symbols_to_trade}")
+
+        # Fetch markets data once
+        print(f"\n[EXECUTE_TRADES] Fetching market data...")
+        markets = api_call_with_retry(ex.fetchMarkets)
+        print(f"[EXECUTE_TRADES] Fetched {len(markets)} markets")
+
+        ## CREATE MARKETS DATAFRAME
+        print(f"\n[EXECUTE_TRADES] Processing market data...")
+        markets_df_from_list = markets_to_dataframe(markets)
+
+        markets_df_filtered = markets_df_from_list[
+            (markets_df_from_list['type'] == 'swap') &
+            (markets_df_from_list['quote'] == 'USDT')
+        ].copy()
+
+        print(f"[EXECUTE_TRADES] Filtered to {len(markets_df_filtered)} swap/USDT markets")
+
+        ## CREATE TOKEN INFO DATAFRAME (CACHE TOKEN INFO)
+        print(f"\n[EXECUTE_TRADES] Building token info cache...")
+        tokens_info = []
+        for symbol in symbols_to_trade:
+            token_info = get_token_info(symbol, markets_df_filtered)
+            if 'error' not in token_info:
+                tokens_info.append(token_info)
+            else:
+                print(f"[EXECUTE_TRADES] Warning: {token_info['error']}")
+
+        tokens_info_df = pd.DataFrame(tokens_info)
+        print(f"[EXECUTE_TRADES] Token info cached for {len(tokens_info_df)} symbols")
+
+        print(f"\n[EXECUTE_TRADES] Setting leverage to {LEVERAGE_FOR_SYMBOLS}x for all symbols...")
+        for index, row in tokens_info_df.iterrows():
+            symbol = row['symbol']
+            try:
+                if set_leverage_smart(ex, LEVERAGE_FOR_SYMBOLS, symbol):
+                    print(f"  ✓ Leverage set for {symbol}: {LEVERAGE_FOR_SYMBOLS}x")
+                time.sleep(RATE_LIMIT_DELAY)
+            except Exception as e:
+                print(f"  ✗ Error setting leverage for {symbol}: {e}")
+                time.sleep(RATE_LIMIT_DELAY)
+
+        ## GET ACCOUNT BALANCE AND CALCULATE POSITION SIZE
+        print("\n" + "="*80)
+        print("[EXECUTE_TRADES] Fetching account balance and calculating position sizes...")
+        print("="*80)
+
+        balance_data = api_call_with_retry(ex.fetchBalance)
+        log_account_balance_to_csv(ex, CSV_ACCOUNT_PNL)
+
+        available_balance = balance_data.get('free', {}).get('USDT', 0)
+        print(f'\n[EXECUTE_TRADES] Account Balance Information:')
+        print(f'  Available Balance (USDT): {available_balance}')
+        print(f'  Total Balance (USDT): {balance_data.get("total", {}).get("USDT", "N/A")}')
+        print(f'  Used Balance (USDT): {balance_data.get("used", {}).get("USDT", "N/A")}')
+        print(f'  Symbols to trade: {len(symbols_to_trade)}')
+        size_use_per_symbol = (available_balance / len(symbols_to_trade)) * LEVERAGE_FOR_ORDERS
+        print(f'  Size per symbol (with leverage): {size_use_per_symbol:.2f} USDT')
+
+        
+        ## PHASE 1: PLACE ALL ORDERS
+        print("\n" + "="*80)
+        print("[EXECUTE_TRADES] PHASE 1: Placing all market orders...")
+        print("="*80)
+
+        # Store all order IDs and symbols for later fetching
+        all_orders_to_fetch = []
+
+        # Execute Phase 1: Place all orders
+        for i, symbol in enumerate(symbols_to_trade, 1):
+            print(f"\n[EXECUTE_TRADES] Symbol {i}/{len(symbols_to_trade)}: {symbol}")
+            place_short_mk_order_professional(ex, symbol, size_use_per_symbol, markets_df_filtered, all_orders_to_fetch)
+            
+            # Rate limiting between symbols
+            if i < len(symbols_to_trade):
+                time.sleep(SLEEP_BETWEEN_SYMBOLS)
+
+        print(f"\n[EXECUTE_TRADES] ✓ Phase 1 complete: {len(all_orders_to_fetch)} orders placed")
+
+        ## PHASE 2: FETCH COMPLETE ORDER DETAILS
+        if all_orders_to_fetch:
+            print("\n" + "="*80)
+            print(f"[EXECUTE_TRADES] PHASE 2: Fetching complete order details for {len(all_orders_to_fetch)} orders...")
+            print("="*80)
+            
+            orders_fetched = {}
+            max_fetch_retries = 5
+            retry_delay_base = 1.0
+            
+            for attempt in range(max_fetch_retries):
+                remaining_orders = [o for o in all_orders_to_fetch if o['order_id'] not in orders_fetched]
+                
+                if not remaining_orders:
+                    print(f"\n[EXECUTE_TRADES] ✓ Successfully fetched all {len(orders_fetched)} order details!")
+                    break
+                
+                print(f"\n[EXECUTE_TRADES] Attempt {attempt + 1}/{max_fetch_retries}: Fetching {len(remaining_orders)} remaining orders...")
+                
+                for order_info in remaining_orders:
+                    order_id = order_info['order_id']
+                    symbol = order_info['symbol']
+                    
+                    try:
+                        # Try to fetch the complete order details
+                        order_filled = api_call_with_retry(ex.fetchOpenOrder, order_id)
+                        
+                        if order_filled and order_filled.get('status'):
+                            print(f"  ✓ {symbol} (Part {order_info.get('part', '1/1')}): Order {order_id} fetched")
+                            print(f"    Status: {order_filled.get('status', 'N/A')}")
+                            print(f"    Filled: {order_filled.get('filled', 0)}")
+                            
+                            # Extract additional info if available
+                            if 'info' in order_filled:
+                                info = order_filled['info']
+                                if isinstance(info, dict):
+                                    avg_price = info.get('avgPrice', order_filled.get('average', 'N/A'))
+                                    print(f"    Average Price: {avg_price}")
+                                    exec_qty = info.get('executedQty', order_filled.get('filled', 'N/A'))
+                                    print(f"    Executed Qty: {exec_qty}")
+                            
+                            # Log trade to CSV
+                            log_trade_to_csv(order_filled, symbol, 'market')
+                            
+                            # Mark as successfully fetched
+                            orders_fetched[order_id] = order_filled
+                        else:
+                            print(f"  ⏳ {symbol}: Order {order_id} - data not yet available")
+                            
+                    except Exception as fetch_error:
+                        error_type = type(fetch_error).__name__
+                        if 'NotFound' in error_type or 'OrderNotFound' in error_type:
+                            # Order might be already filled, try alternative fetch method
+                            try:
+                                # Try to use the initial order data if available
+                                initial_order = order_info.get('initial_order')
+                                if initial_order:
+                                    print(f"  ⚠ {symbol}: Order {order_id} not found in open orders, using initial order data")
+                                    log_trade_to_csv(initial_order, symbol, 'market')
+                                    orders_fetched[order_id] = initial_order
+                            except Exception as e:
+                                print(f"  ⏳ {symbol}: Order {order_id} - {error_type}: {str(e)}")
+                        else:
+                            print(f"  ⏳ {symbol}: Order {order_id} - {error_type}: {str(fetch_error)}")
+                    
+                    # Rate limiting between fetches
+                    time.sleep(RATE_LIMIT_DELAY)
+                
+                # Wait between retry attempts if there are still unfetched orders
+                if remaining_orders:
+                    wait_time = retry_delay_base * (attempt + 1)
+                    print(f"\n[EXECUTE_TRADES] Waiting {wait_time}s before next fetch attempt...")
+                    time.sleep(wait_time)
+            
+        # Handle any orders that couldn't be fetched
+        unfetched_orders = [o for o in all_orders_to_fetch if o['order_id'] not in orders_fetched]
+        if unfetched_orders:
+            print(f"\n[EXECUTE_TRADES] Warning: Could not fetch complete details for {len(unfetched_orders)} orders")
+            for order_info in unfetched_orders:
+                print(f"  - {order_info['symbol']} (Part {order_info.get('part', '1/1')}): Order ID {order_info['order_id']}")
+                # Log initial order data as fallback
+                print(f"    Logging initial order data (complete details unavailable)")
+                log_trade_to_csv(order_info['initial_order'], order_info['symbol'], 'market') 
+
+        print("\n" + "="*80)
+        print("[EXECUTE_TRADES] Logging final account balance...")
+        log_account_balance_to_csv(ex, CSV_ACCOUNT_PNL)
+        print("\n[EXECUTE_TRADES] Professional trade execution completed!")
+        print("="*80)
+
+        # Return success response
+        return {
+            'status': 'success',
+            'message': 'Trade execution completed successfully',
+            'orders_placed': len(all_orders_to_fetch),
+            'symbols_traded': len(symbols_to_trade),
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }, 200
+                
+    except Exception as e:
+        error_msg = f"ERROR: {type(e).__name__}: {e}"
+        print(f"[run_script_one] {error_msg}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        
+        return {
+            'status': 'error',
+            'message': error_msg,
+        }, 500
+
+script 3
+
+import pandas as pd
+import ccxt
+import time
+import os
+import sys
+from datetime import datetime, timezone
+import json
+import math
+import pprint
+import functions_framework
+from google.cloud import storage
+from io import StringIO
+
+CSV_FILE = 'weekday_bybit_latest.csv'
+CSV_ACCOUNT_PNL = 'account_pnl.csv'
+CSV_ACCOUNT_TRADES = 'account_trades.csv'
+CSV_ACCOUNT_POSITIONS = 'account_positions_final.csv'
+SCRIPT_NAME = 'Final_3A_Script_Bybit_YN10k_CloseTrades_Professional'
+SCRIPT_NAME_SHORT = 'Close_Trades'
+
+SLEEP_BETWEEN_ORDERS = 0.5  # Sleep time between orders to avoid rate limits
+MAX_ITERATIONS = 100  # Safety limit to prevent infinite loops
+
+# API Credentials for Bybit Testnet/Demo
+# Get your testnet API keys from: https://testnet.bybit.com/
+API_KEY = "oNZyTs1IiwoUzxrQoS"  # Set your testnet API key here (or use environment variable)
+API_SECRET = 'rGTHocjMqekaoLqTb3LVFyb6dPYJVXm0J2QF'  # Set your testnet API secret here (or use environment variable)
+
+#API_KEY = "lne7tDweBLrP0t8i9u"  # Set your testnet API key here (or use environment variable)
+#API_SECRET = 'oQ1LRCl2tRHE9e5VTKLw81gYYf8yffTGXClj'  # Set your testnet API secret here (or use environment variable)
+
+# Google Cloud Storage configuration
+# Set this via environment variable GCS_BUCKET_NAME or update the default below
+GCS_BUCKET_NAME = os.environ.get('GCS_BUCKET_NAME', 'bucket-test2-30tokens-data')  # Update with your bucket name
+
+
+#FUNCTION TO DECLARE EXCHANGE
+def boot_exchange_demo():
+    """Initialize Bybit demo/testnet exchange"""
+    config = {
+        "enableRateLimit": True,
+        "options": {"defaultType": "future"}
+    }
+
+    # Add API credentials if provided
+    api_key = API_KEY or None
+    api_secret = API_SECRET or None
+
+    if api_key and api_secret:
+        config["apiKey"] = api_key
+        config["secret"] = api_secret
+
+    ex = ccxt.bybit(config)
+    #ex.set_sandbox_mode(True)  # Enable demo/testnet mode
+    ex.enable_demo_trading(True)
+    return ex
+
+## CSV LOGGING FUNCTIONS
+
+def write_csv_to_gcs(df: pd.DataFrame, gcs_blob_name: str, bucket_name: str = GCS_BUCKET_NAME) -> str:
+    """
+    Write a pandas DataFrame to Google Cloud Storage as CSV.
+    Appends to existing file if it exists, otherwise creates new file.
+    
+    Args:
+        df: DataFrame to write
+        gcs_blob_name: Name/path for the file in GCS bucket
+        bucket_name: Name of the GCS bucket
+        
+    Returns:
+        Full GCS path (gs://bucket_name/blob_name)
+    """
+    try:
+        print(f"[write_csv_to_gcs] Writing DataFrame to gs://{bucket_name}/{gcs_blob_name}")
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(gcs_blob_name)
+        
+        # Check if file exists
+        if blob.exists():
+            # Read existing CSV
+            try:
+                existing_csv = blob.download_as_text()
+                df_existing = pd.read_csv(StringIO(existing_csv))
+                # Combine with new data
+                df_combined = pd.concat([df_existing, df], ignore_index=True)
+                print(f"[write_csv_to_gcs] Appending to existing file (existing: {len(df_existing)} rows, new: {len(df)} rows)")
+            except Exception as read_error:
+                # If reading fails, just write new data
+                print(f"[write_csv_to_gcs] Warning: Could not read existing file, overwriting: {read_error}")
+                df_combined = df
+        else:
+            # Create new file
+            df_combined = df
+            print(f"[write_csv_to_gcs] Creating new file with {len(df)} rows")
+        
+        # Convert DataFrame to CSV string
+        csv_string = df_combined.to_csv(index=False)
+        
+        # Upload to GCS
+        blob.upload_from_string(csv_string, content_type='text/csv')
+        
+        gcs_path = f"gs://{bucket_name}/{gcs_blob_name}"
+        print(f"[write_csv_to_gcs] Successfully wrote {len(df_combined)} rows to {gcs_path}")
+        return gcs_path
+    except Exception as e:
+        print(f"[write_csv_to_gcs] ERROR writing to GCS: {type(e).__name__}: {e}", file=sys.stderr)
+        raise
+
+def log_account_balance_to_csv(exchange, csv_file: str = CSV_ACCOUNT_PNL, bucket_name: str = GCS_BUCKET_NAME):
+    """
+    Fetch account balance and log to CSV file in Google Cloud Storage.
+    Creates file with headers if it doesn't exist, appends if it does.
+    Always preserves existing data by reading, appending, then writing back.
+    """
+    try:
+        # Fetch balance
+        balance_data = exchange.fetchBalance()
+        
+        # Extract relevant balance information
+        timestamp = datetime.now(timezone.utc)
+        
+        # Prepare record with timestamp and all balance info
+        record = {
+            'timestamp': timestamp.isoformat(),
+            'timestamp_utc': timestamp.strftime('%Y-%m-%d %H:%M:%S UTC'),
+            'date': timestamp.strftime('%Y-%m-%d'),
+            'time': timestamp.strftime('%H:%M:%S'),
+            'script_name': SCRIPT_NAME_SHORT,
+        }
+        
+        # Add all currencies from the balance
+        if 'free' in balance_data:
+            for currency, value in balance_data['free'].items():
+                record[f'free_{currency}'] = value
+                
+        if 'used' in balance_data:
+            for currency, value in balance_data['used'].items():
+                record[f'used_{currency}'] = value
+                
+        if 'total' in balance_data:
+            for currency, value in balance_data['total'].items():
+                record[f'total_{currency}'] = value
+                
+        # Add info if available
+        if 'info' in balance_data:
+            record['info'] = json.dumps(balance_data['info']) if balance_data['info'] else None
+        
+        # Create DataFrame from new record
+        df_new = pd.DataFrame([record])
+        
+        # Write to GCS (write_csv_to_gcs handles appending if file exists)
+        gcs_path = write_csv_to_gcs(df_new, csv_file, bucket_name)
+        print(f"[log_account_balance] Logged balance record to {gcs_path}")
+            
+        return record
+        
+    except Exception as e:
+        print(f"[log_account_balance] Error logging balance: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def log_trade_to_csv(order_data, symbol: str, order_type: str, csv_file: str = CSV_ACCOUNT_TRADES, bucket_name: str = GCS_BUCKET_NAME):
+    """
+    Log trade details to CSV file in Google Cloud Storage.
+    Creates file with headers if it doesn't exist, appends if it does.
+    Always preserves existing data by reading, appending, then writing back.
+    """
+    try:
+        # Prepare timestamp
+        timestamp = datetime.now(timezone.utc)
+        
+        # Extract order information
+        record = {
+            'timestamp': timestamp.isoformat(),
+            'timestamp_utc': timestamp.strftime('%Y-%m-%d %H:%M:%S UTC'),
+            'date': timestamp.strftime('%Y-%m-%d'),
+            'time': timestamp.strftime('%H:%M:%S'),
+            'symbol': symbol,
+            'order_type': order_type,  # 'market', 'limit', etc.
+            'side': order_data.get('side', 'N/A'),
+            'order_id': order_data.get('id', 'N/A'),
+            'status': order_data.get('status', 'N/A'),
+            'amount': order_data.get('amount', None),
+            'filled': order_data.get('filled', 0),
+            'remaining': order_data.get('remaining', None),
+            'price': order_data.get('price', None),
+            'average': order_data.get('average', None),
+            'cost': order_data.get('cost', None),
+        }
+        
+        # Extract additional info from nested structure if available
+        if 'info' in order_data and order_data['info']:
+            info = order_data['info']
+            # Try to extract more details from info
+            if isinstance(info, dict):
+                record['order_id_exchange'] = info.get('orderId', info.get('order_id', 'N/A'))
+                record['avg_price'] = info.get('avgPrice', info.get('avg_price', None))
+                record['executed_qty'] = info.get('executedQty', info.get('executed_qty', None))
+                record['cum_exec_qty'] = info.get('cumExecQty', info.get('cum_exec_qty', None))
+                record['order_status'] = info.get('orderStatus', info.get('order_status', None))
+                record['create_time'] = info.get('createTime', info.get('create_time', None))
+                record['update_time'] = info.get('updateTime', info.get('update_time', None))
+                
+                # Store full info as JSON for reference
+                record['info_json'] = json.dumps(info) if info else None
+        
+        # Create DataFrame from new record
+        df_new = pd.DataFrame([record])
+        
+        # Write to GCS (write_csv_to_gcs handles appending if file exists)
+        gcs_path = write_csv_to_gcs(df_new, csv_file, bucket_name)
+        print(f"[log_trade] Logged trade record to {gcs_path} for {symbol}")
+            
+        return record
+        
+    except Exception as e:
+        print(f"[log_trade] Error logging trade: {str(e)}")
+        print(f"[log_trade] Order data: {order_data}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+
+## FUNCTIONS TO PROCESS MARKET DATA
+
+def convert_numeric_string(value):
+    """
+    Convert numeric string to appropriate numeric type while preserving precision.
+    Handles integers, floats, and scientific notation.
+    Always returns a number (int or float), never a string.
+    """
+    if isinstance(value, (int, float)):
+        return value
+    elif isinstance(value, str) and value.strip():
+        try:
+            if '.' not in value and 'e' not in value.lower() and 'E' not in value:
+                try:
+                    return int(value)
+                except ValueError:
+                    pass
+            return float(value)
+        except (ValueError, TypeError):
+            return value
+    return value
+
+def flatten_market_item(item: dict, parent_key: str = '', sep: str = '_') -> dict:
+    """
+    Flatten a market item dictionary, converting nested structures to flat columns.
+    Converts numeric strings to numbers while preserving precision.
+    All keys are lowercase.
+    """
+    flattened = {}
+    for k, v in item.items():
+        new_key = f"{parent_key}{sep}{k.lower()}" if parent_key else k.lower()
+        if isinstance(v, dict):
+            nested = flatten_market_item(v, new_key, sep=sep)
+            flattened.update(nested)
+        elif isinstance(v, list):
+            flattened[new_key] = str(v) if len(str(v)) < 100 else str(v)[:100] + '...'
+        elif v is None:
+            flattened[new_key] = None
+        elif isinstance(v, str):
+            numeric_val = convert_numeric_string(v)
+            flattened[new_key] = numeric_val
+        else:
+            flattened[new_key] = v
+    return flattened
+
+def markets_to_dataframe(markets_list: list) -> pd.DataFrame:
+    """
+    Convert list of market dictionaries to a flattened DataFrame.
+    Preserves numeric precision, expands nested structures, all lowercase columns.
+    """
+    flattened_items = []
+    for item in markets_list:
+        flattened = flatten_market_item(item)
+        flattened_items.append(flattened)
+    
+    df = pd.DataFrame(flattened_items)
+    df.columns = [col.lower() if isinstance(col, str) else str(col).lower() for col in df.columns]
+    return df
+
+## GET TOKEN INFO FUNCTION
+def get_token_info(symbol: str, markets_df: pd.DataFrame) -> dict:
+    """Get market info for a specific token"""
+    token_row = markets_df[markets_df['symbol'] == symbol]
+    if not token_row.empty:
+        return token_row.iloc[0].to_dict()
+    else:
+        return {'error': f'Symbol {symbol} not found'}
+
+
+
+@functions_framework.http
+def run_script_close_trades(request):
+    """
+    Google Cloud Functions HTTP entry point.
+    This function is called when the Cloud Function is triggered via HTTP.
+    """
+    try:
+        print(f"[run_script_close_trades] Cloud Function triggered at {datetime.now(timezone.utc).isoformat()}")
+        print(f"[run_script_close_trades] Using GCS bucket: {GCS_BUCKET_NAME}")
+        
+        ## Activate Exchange
+        ex = boot_exchange_demo()
+
+        #%%
+        ## GET MARKET DATA
+        print("="*80)
+        print("[CLOSE_TRADES] Loading market data...")
+        print("="*80)
+
+        markets = ex.fetchMarkets()
+
+        ## CREATE MARKETS DATAFRAME
+        markets_df_from_list = markets_to_dataframe(markets)
+        markets_df_filtered = markets_df_from_list[
+            (markets_df_from_list['type'] == 'swap') &
+            (markets_df_from_list['quote'] == 'USDT')
+        ].copy()
+
+        print(f"[CLOSE_TRADES] Filtered markets: {markets_df_filtered.shape} (swap + USDT)")
+
+        ## Log account balance at the beginning
+        print("\n" + "="*80)
+        print("[CLOSE_TRADES] Starting professional position closing process...")
+        print("="*80)
+        print(f"\n[CLOSE_TRADES] Logging initial account balance...")
+        log_account_balance_to_csv(ex, CSV_ACCOUNT_PNL)
+
+        ## Get all current open positions
+        print(f"\n[CLOSE_TRADES] Fetching open positions...")
+        open_positions = ex.fetchPositions()
+
+        # CONVERT open_positions INTO DATAFRAME
+        open_positions_df = pd.DataFrame(open_positions)
+
+        # Filter only positions with non-zero contracts
+        if open_positions_df.empty or len(open_positions_df.columns) == 0:
+            print("\n[CLOSE_TRADES] No open positions found (empty DataFrame). Nothing to close.")
+            open_positions_df = pd.DataFrame()
+        else:
+            # Check which column name is used for contracts
+            contract_column = None
+            for col_name in ['contracts', 'contract', 'size', 'amount', 'positionSize']:
+                if col_name in open_positions_df.columns:
+                    contract_column = col_name
+                    break
+            
+            if contract_column is None:
+                print(f"\n[CLOSE_TRADES] Warning: Could not find contracts column. Available columns: {list(open_positions_df.columns)}")
+                print("[CLOSE_TRADES] No positions to close.")
+                open_positions_df = pd.DataFrame()
+            else:
+                open_positions_df = open_positions_df[open_positions_df[contract_column] != 0].copy()
+                
+                if open_positions_df.empty:
+                    print("\n[CLOSE_TRADES] No open positions found. Nothing to close.")
+                else:
+                    print(f"\n[CLOSE_TRADES] Found {len(open_positions_df)} open positions:")
+                    # Show available columns
+                    available_cols = ['symbol', contract_column]
+                    for col in ['side', 'unrealizedPnl', 'positionSide']:
+                        if col in open_positions_df.columns:
+                            available_cols.append(col)
+                    print(open_positions_df[available_cols].to_string())
+
+        ### CLOSE ALL POSITIONS PROFESSIONALLY - Loop until all positions are closed
+
+        if not open_positions_df.empty:
+            print("\n" + "="*80)
+            print("[CLOSE_TRADES] Starting to close positions...")
+            print("="*80)
+            
+            # Store ALL order IDs and symbols to fetch details AFTER all positions are closed
+            all_orders_to_fetch = []
+            
+            iteration = 0
+            all_closed = False
+            
+            while not all_closed and iteration < MAX_ITERATIONS:
+                iteration += 1
+                print(f"\n[CLOSE_TRADES] Iteration {iteration} - Checking for open positions...")
+                
+                # Fetch current positions
+                try:
+                    current_positions = ex.fetchPositions()
+                    current_positions_df = pd.DataFrame(current_positions)
+                    
+                    # Check if DataFrame is empty or has no columns
+                    if current_positions_df.empty or len(current_positions_df.columns) == 0:
+                        print("[CLOSE_TRADES] No positions found (empty DataFrame).")
+                        all_closed = True
+                        break
+                    
+                    # Check which column name is used for contracts
+                    contract_column = None
+                    for col_name in ['contracts', 'contract', 'size', 'amount', 'positionSize']:
+                        if col_name in current_positions_df.columns:
+                            contract_column = col_name
+                            break
+                    
+                    if contract_column is None:
+                        print(f"[CLOSE_TRADES] Warning: Could not find contracts column. Available columns: {list(current_positions_df.columns)}")
+                        print("[CLOSE_TRADES] Assuming no positions to close.")
+                        all_closed = True
+                        break
+                    
+                    # Filter only positions with non-zero contracts
+                    current_positions_df = current_positions_df[current_positions_df[contract_column] != 0].copy()
+                    
+                    if current_positions_df.empty:
+                        print("[CLOSE_TRADES] All positions have been closed!")
+                        all_closed = True
+                        break
+                        
+                except Exception as fetch_error:
+                    print(f"[CLOSE_TRADES] Error fetching positions: {fetch_error}")
+                    print("[CLOSE_TRADES] Retrying in next iteration...")
+                    time.sleep(SLEEP_BETWEEN_ORDERS * 2)
+                    continue
+                
+                print(f"[CLOSE_TRADES] Found {len(current_positions_df)} positions still open")
+                
+                # PHASE 1: Close all positions professionally (respecting max order size)
+                print(f"\n[CLOSE_TRADES] PHASE 1: Closing all positions (respecting max order size)...")
+                
+                for index, row in current_positions_df.iterrows():
+                    # Get symbol
+                    symbol = None
+                    for col_name in ['symbol', 'info']:
+                        if col_name in row.index:
+                            if col_name == 'info' and isinstance(row[col_name], dict):
+                                symbol = row[col_name].get('symbol')
+                            else:
+                                symbol = row[col_name]
+                            break
+                    
+                    if symbol is None:
+                        print(f"[CLOSE_TRADES] Warning: Could not find symbol for row {index}. Skipping.")
+                        continue
+                    
+                    # Get contracts amount
+                    contracts = abs(float(row[contract_column]))
+                    
+                    # Get position side
+                    position_side = None
+                    for col_name in ['side', 'positionSide', 'position']:
+                        if col_name in row.index:
+                            position_side = str(row[col_name]).lower()
+                            break
+                    
+                    if position_side is None:
+                        position_side = 'short'
+                        print(f"[CLOSE_TRADES] Warning: Could not determine position side for {symbol}, defaulting to 'short'")
+                    
+                    # Determine closing side
+                    if position_side == 'short':
+                        close_side = 'buy'
+                    elif position_side == 'long':
+                        close_side = 'sell'
+                    else:
+                        close_side = 'buy'
+                        print(f"[CLOSE_TRADES] Warning: Unknown position side '{position_side}' for {symbol}, using 'buy'")
+                    
+                    print(f"\n[CLOSE_TRADES] Closing {position_side} position: {symbol}, {contracts} contracts (side: {close_side})")
+                    
+                    try:
+                        # Get token info to check max market order quantity
+                        token_info = get_token_info(symbol, markets_df_filtered)
+                        max_market_order_quantity = token_info.get('info_lotsizefilter_maxmktorderqty')
+                        
+                        # Handle None or NaN values - use max_order_qty as fallback, then limits_amount_max
+                        if max_market_order_quantity is None or pd.isna(max_market_order_quantity):
+                            max_market_order_quantity = token_info.get('info_lotsizefilter_maxorderqty')
+                        if max_market_order_quantity is None or pd.isna(max_market_order_quantity):
+                            max_market_order_quantity = token_info.get('limits_amount_max', float('inf'))
+                        if max_market_order_quantity is None or pd.isna(max_market_order_quantity):
+                            max_market_order_quantity = float('inf')  # No limit if not available
+                        
+                        print(f"  Max market order quantity: {max_market_order_quantity}")
+                        
+                        # Check if we need to split the order
+                        if contracts > max_market_order_quantity:
+                            # Split into multiple orders
+                            num_parts = int(math.ceil(contracts / max_market_order_quantity))
+                            contracts_per_part = contracts / num_parts
+                            
+                            print(f"  Contract size ({contracts}) exceeds max order size ({max_market_order_quantity})")
+                            print(f"  Splitting into {num_parts} orders of ~{contracts_per_part:.2f} contracts each")
+                            print(f"  ----------------------------------------")
+                            
+                            # Place multiple orders
+                            for part_num in range(num_parts):
+                                try:
+                                    order = ex.create_market_order(
+                                        symbol=symbol,
+                                        side=close_side,
+                                        amount=contracts_per_part,
+                                        params={'reduceOnly': True}
+                                    )
+                                    
+                                    order_id = order.get('id')
+                                    print(f"  ✓ Order {part_num + 1}/{num_parts} executed for {symbol} - Order ID: {order_id}")
+                                    
+                                    # Store order ID for later fetching
+                                    all_orders_to_fetch.append({
+                                        'order_id': order_id,
+                                        'symbol': symbol,
+                                        'initial_order': order
+                                    })
+                                    
+                                    # Minimal delay for rate limiting
+                                    time.sleep(SLEEP_BETWEEN_ORDERS * 0.1)
+                                    
+                                except Exception as part_error:
+                                    print(f"  ✗ Error placing part {part_num + 1} for {symbol}: {str(part_error)}")
+                                    time.sleep(SLEEP_BETWEEN_ORDERS * 0.1)
+                            
+                            print(f"  ----------------------------------------")
+                            
+                        else:
+                            # Single order - contract size is within limits
+                            print(f"  Contract size within limits, placing single order")
+                            
+                            order = ex.create_market_order(
+                                symbol=symbol,
+                                side=close_side,
+                                amount=contracts,
+                                params={'reduceOnly': True}
+                            )
+                            
+                            order_id = order.get('id')
+                            print(f"  ✓ Order executed for {symbol} - Order ID: {order_id}")
+                            
+                            # Store order ID for later fetching
+                            all_orders_to_fetch.append({
+                                'order_id': order_id,
+                                'symbol': symbol,
+                                'initial_order': order
+                            })
+                            
+                            # Minimal delay for rate limiting
+                            time.sleep(SLEEP_BETWEEN_ORDERS * 0.1)
+                        
+                    except Exception as e:
+                        print(f"[CLOSE_TRADES] ✗ Error closing {symbol}: {str(e)}")
+                        time.sleep(SLEEP_BETWEEN_ORDERS * 0.1)
+                
+                if not all_closed:
+                    print(f"\n[CLOSE_TRADES] Waiting before next iteration...")
+                    time.sleep(SLEEP_BETWEEN_ORDERS * 2)
+            
+            # PHASE 2: Fetch order details for ALL closed orders (after all positions are closed)
+            if all_orders_to_fetch:
+                print(f"\n" + "="*80)
+                print(f"[CLOSE_TRADES] PHASE 2: Fetching order details for {len(all_orders_to_fetch)} orders...")
+                print(f"[CLOSE_TRADES] All positions have been closed. Now fetching order information.")
+                print("="*80)
+                
+                # Keep track of which orders we've successfully fetched
+                orders_fetched = {}
+                max_retries = 10
+                retry_delay_base = 2  # Base delay in seconds
+                
+                for attempt in range(max_retries):
+                    remaining_orders = [o for o in all_orders_to_fetch if o['order_id'] not in orders_fetched]
+                    
+                    if not remaining_orders:
+                        print(f"\n[CLOSE_TRADES] ✓ Successfully fetched all {len(orders_fetched)} order details!")
+                        break
+                    
+                    print(f"\n[CLOSE_TRADES] Attempt {attempt + 1}/{max_retries}: Fetching {len(remaining_orders)} remaining orders...")
+                    
+                    for order_info in remaining_orders:
+                        order_id = order_info['order_id']
+                        symbol = order_info['symbol']
+                        
+                        try:
+                            order_filled = ex.fetchClosedOrder(order_id, symbol)
+                            
+                            # Verify we got valid data
+                            if order_filled and order_filled.get('status'):
+                                print(f"  ✓ {symbol}: Order {order_id} fetched successfully")
+                                
+                                # Display order details
+                                print(f"    Status: {order_filled.get('status', 'N/A')}")
+                                print(f"    Filled: {order_filled.get('filled', 0)}")
+                                print(f"    Average Price: {order_filled.get('average', 'N/A')}")
+                                print(f"    Cost: {order_filled.get('cost', 'N/A')}")
+                                
+                                # Extract additional info if available
+                                if 'info' in order_filled:
+                                    info = order_filled['info']
+                                    if isinstance(info, dict):
+                                        print(f"    Order ID (exchange): {info.get('orderId', 'N/A')}")
+                                        print(f"    Order Status: {info.get('orderStatus', 'N/A')}")
+                                        print(f"    Cum Exec Qty: {info.get('cumExecQty', 'N/A')}")
+                                        print(f"    Cum Exec Value: {info.get('cumExecValue', 'N/A')}")
+                                
+                                # Log trade to CSV with complete order information
+                                log_trade_to_csv(order_filled, symbol, 'market')
+                                
+                                # Mark as successfully fetched
+                                orders_fetched[order_id] = order_filled
+                            else:
+                                print(f"  ⏳ {symbol}: Order {order_id} - data not yet available (empty response)")
+                                
+                        except Exception as fetch_error:
+                            print(f"  ⏳ {symbol}: Order {order_id} - waiting for data: {type(fetch_error).__name__}")
+                        
+                        # Small delay between fetches
+                        time.sleep(SLEEP_BETWEEN_ORDERS)
+                    
+                    # Wait longer between retry attempts (exponential backoff)
+                    if remaining_orders:
+                        wait_time = retry_delay_base * (attempt + 1)
+                        print(f"\n[CLOSE_TRADES] Waiting {wait_time} seconds before next attempt...")
+                        time.sleep(wait_time)
+                
+                # Handle any orders that couldn't be fetched
+                unfetched_orders = [o for o in all_orders_to_fetch if o['order_id'] not in orders_fetched]
+                if unfetched_orders:
+                    print(f"\n[CLOSE_TRADES] Warning: Could not fetch details for {len(unfetched_orders)} orders after {max_retries} attempts")
+                    for order_info in unfetched_orders:
+                        print(f"  - {order_info['symbol']}: Order ID {order_info['order_id']}")
+                        # Log initial order data as fallback
+                        print(f"    Logging initial order data (complete details unavailable)")
+                        log_trade_to_csv(order_info['initial_order'], order_info['symbol'], 'market')
+            
+            if iteration >= MAX_ITERATIONS:
+                print(f"\n[CLOSE_TRADES] Warning: Reached maximum iterations ({MAX_ITERATIONS}). Some positions may still be open.")
+                
+                # Final check
+                try:
+                    final_positions = ex.fetchPositions()
+                    final_positions_df = pd.DataFrame(final_positions)
+                    
+                    if not final_positions_df.empty and len(final_positions_df.columns) > 0:
+                        # Find contract column
+                        contract_column = None
+                        for col_name in ['contracts', 'contract', 'size', 'amount', 'positionSize']:
+                            if col_name in final_positions_df.columns:
+                                contract_column = col_name
+                                break
+                        
+                        if contract_column:
+                            final_positions_df = final_positions_df[final_positions_df[contract_column] != 0].copy()
+                            
+                            if not final_positions_df.empty:
+                                print(f"[CLOSE_TRADES] Remaining open positions:")
+                                available_cols = ['symbol', contract_column]
+                                for col in ['side', 'unrealizedPnl', 'positionSide']:
+                                    if col in final_positions_df.columns:
+                                        available_cols.append(col)
+                                print(final_positions_df[available_cols].to_string())
+                            else:
+                                print("[CLOSE_TRADES] All positions successfully closed!")
+                        else:
+                            print(f"[CLOSE_TRADES] Could not determine contract column. Available columns: {list(final_positions_df.columns)}")
+                    else:
+                        print("[CLOSE_TRADES] All positions successfully closed!")
+                except Exception as final_check_error:
+                    print(f"[CLOSE_TRADES] Error in final position check: {final_check_error}")
+
+            ## Log final account balance
+            print("\n" + "="*80)
+            print("[CLOSE_TRADES] Logging final account balance...")
+            
+            print("\n[CLOSE_TRADES] Professional position closing process completed!")
+            print("="*80)
+            #Wait for 1 second
+            time.sleep(10)
+            log_account_balance_to_csv(ex, CSV_ACCOUNT_PNL, GCS_BUCKET_NAME)
+            print(f"[CLOSE_TRADES] Final account balance logged to {GCS_BUCKET_NAME}/{CSV_ACCOUNT_PNL}")
+
+
+
+
+
+        # Return success response
+        return {
+            'status': 'success',
+            'message': 'Position closing process completed successfully',
+            'orders_placed': len(all_orders_to_fetch) if 'all_orders_to_fetch' in locals() else 0,
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }, 200
+                
+    except Exception as e:
+        error_msg = f"ERROR: {type(e).__name__}: {e}"
+        print(f"[run_script_close_trades] {error_msg}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        
+        return {
+            'status': 'error',
+            'message': error_msg,
+        }, 500
+
+analiza las propuestas, dame pros y contras de ambas y hazme preguntas de caso de ser importnte agregar o complementar informacion que no este clara
+
+no generes codigo, responde a las preguntas de arriba

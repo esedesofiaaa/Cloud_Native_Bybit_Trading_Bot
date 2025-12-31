@@ -1,0 +1,74 @@
+main:
+  params: [input]
+  steps:
+    - init:
+        assign:
+          - project_id: "bybitcronjobs"
+          
+          # --- CONFIGURACIÓN DEL JOB 1 (El Generador) ---
+          - job1_config:
+              name: "script1-generador"
+              location: "europe-west1"
+
+          # --- CONFIGURACIÓN DEL JOB 2 (Los Ejecutores por Región) ---
+          # Aquí defines cada región y qué tests corren dentro de ella.
+          # Puedes agregar o quitar tests de cada lista según necesites.
+          - global_executions:
+              - region: "europe-west1"
+                job_name: "script2-executor-europe-west1"
+                tests:
+                  - { id: "test1_5tkn", secret: "test1_5tkn_creds", tokens: "5" }
+                  - { id: "test1_10tkn",   secret: "test1_10tkn_creds",   tokens: "10" }
+                  - { id: "test1_30tkn", secret: "test1_30tkn_creds", tokens: "30" }
+
+              - region: "asia-northeast1"
+                job_name: "script2-executor-asia-northeast1"
+                tests:
+                  - { id: "test2_5tkn", secret: "test2_5tkn_creds", tokens: "5" }
+                  - { id: "test2_10tkn",   secret: "test2_10tkn_creds",   tokens: "10" }
+                  - { id: "test2_30tkn", secret: "test2_30tkn_creds", tokens: "30" }  
+
+    # ==========================================
+    # PASO 1: Ejecutar el Generador (Job 1)
+    # ==========================================
+    - ejecutar_job1_generador:
+        call: googleapis.run.v1.namespaces.jobs.run
+        args:
+          name: ${"namespaces/" + project_id + "/jobs/" + job1_config.name}
+          location: ${job1_config.location}
+        result: job1_result
+
+    # ==========================================
+    # PASO 2: Fan-out Global (Regiones en Paralelo)
+    # ==========================================
+    - procesar_regiones:
+        parallel:
+          for:
+            value: region_config
+            in: ${global_executions}
+            steps:
+                # Dentro de cada región, hacemos otro Fan-out para sus tests
+                - procesar_tests_de_region:
+                    parallel:
+                      for:
+                        value: test_config
+                        in: ${region_config.tests}
+                        steps:
+                          - lanzar_job2_especifico:
+                              call: googleapis.run.v1.namespaces.jobs.run
+                              args:
+                                name: ${"namespaces/" + project_id + "/jobs/" + region_config.job_name}
+                                location: ${region_config.region}
+                                body:
+                                  overrides:
+                                    containerOverrides:
+                                      - env:
+                                          - name: "TEST_ID"
+                                            value: ${test_config.id}
+                                          - name: "SECRET_NAME"
+                                            value: ${test_config.secret}
+                                          - name: "TARGET_TOKEN_COUNT"
+                                            value: ${test_config.tokens}
+    
+    - final:
+        return: "Ciclo completo ejecutado en las 3 regiones."

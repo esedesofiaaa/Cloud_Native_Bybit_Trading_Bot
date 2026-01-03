@@ -1,0 +1,10 @@
+main:
+  steps:
+    - run_unifier:
+        call: googleapis.run.v1.namespaces.jobs.run
+        args:
+          name: "namespaces/bybitcronjobs/jobs/script4-unifier"
+          location: "europe-west1"
+        result: job_result
+    - return_result:
+        return: ${job_result}
